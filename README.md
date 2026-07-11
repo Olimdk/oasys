@@ -79,6 +79,17 @@ Change it from the app with `/settings set <key> <value>`, or edit the file dire
     /stop        halt an /overnight run
     /plugin      install skills/plugins from a marketplace
 
+## Using the TUI (composer, scrolling, interrupting)
+
+- The input box is a real multi-line editor. **Enter** sends your message; **Shift+Enter**
+  inserts a newline. The box grows as you add lines (and scrolls once it reaches ~12 lines).
+- You can **scroll the chat freely** with the mouse / arrow keys while OASYS is responding.
+  Auto-follow pauses while you are scrolled up, and resumes automatically when you return to
+  the bottom.
+- While OASYS is generating or running overnight, you can **interrupt at any time**:
+  press **Enter on an empty input** (or type `/stop`). It stops after the current step/action
+  without losing your conversation.
+
 ## Adding a provider
 No code required for any OpenAI-compatible chat-completions API. From the app:
 

@@ -1,10 +1,21 @@
-"""OASYS TUI — Claude Code-style terminal chat interface."""
+"""OASYS TUI - Claude Code-style terminal chat interface.
+
+UX:
+- Multi-line composer (TextArea): Enter submits, Shift+Enter inserts a newline.
+  The box auto-grows and gets its own scrollbar if it exceeds max height.
+- The chat (RichLog) keeps following new output, but if you scroll up it stops
+  auto-following so you can read; it resumes following when you return to the
+  bottom (or when a new submission starts).
+- You can interrupt an in-flight agent/overnight run at any time by typing
+  /stop (or just pressing Enter in an empty composer while a run is active).
+"""
 import re
 import time
 import asyncio
 from textual.app import App, ComposeResult
-from textual.widgets import Input, Static, RichLog
+from textual.widgets import TextArea, Static, RichLog
 from textual.containers import Vertical
+from textual import events
 from rich.markdown import Markdown
 from rich.text import Text
 
@@ -23,9 +34,6 @@ from oasys import keystore
 # never literally contains backticks (which would break file-write fences).
 BACKTICK = chr(96)
 FENCE = BACKTICK * 3
-
-COMMANDS = ["/help", "/skills", "/plugins", "/run", "/model", "/clear", "/compact",
-            "/settings", "/key", "/goal", "/overnight", "/stop", "/plugin"]
 
 EDIT_PATTERN = re.compile(r"EDIT:\s*(\S+)\s*\n" + FENCE + r"[a-zA-Z0-9_+-]*\n(.*?)" + FENCE, re.DOTALL)
 READ_PATTERN = re.compile(r"^READ:\s*(\S+)\s*$", re.MULTILINE)
@@ -58,13 +66,22 @@ def base_prompt(skills_prompt: str) -> str:
 class OasysApp(App):
     CSS = """
     Screen { background: #0c0c0c; }
-    RichLog { background: #0c0c0c; border: none; padding: 1 2; scrollbar-size: 1 1; }
+    RichLog { background: #0c0c0c; border: none; padding: 1 2; }
     #status { background: #0c0c0c; color: #444444; padding: 0 2; height: 1; }
-    Input {
-        background: #0c0c0c; border: none; border-top: solid #2a2a2a;
-        padding: 0 2; color: #e0e0e0;
+    #composer {
+        background: #0c0c0c;
+        border: solid #2a2a2a;
+        height: auto;
+        max-height: 12;
+        padding: 0 1;
     }
-    Input:focus { border-top: solid #c15f3c; }
+    #composer:focus { border: solid #c15f3c; }
+    #composer TextArea {
+        background: #0c0c0c;
+        border: none;
+        padding: 0;
+        color: #e0e0e0;
+    }
     """
     BINDINGS = [
         ("ctrl+c", "quit", "Quit"),
@@ -80,6 +97,9 @@ class OasysApp(App):
         self.overnight_active = False
         self.overnight_end = 0.0
         self.overnight_task = None
+        self.cancelled = asyncio.Event()   # set while a run is in flight
+        self.running = False               # True only while an agent/overnight loop is active
+        self.auto_follow = True            # chat follows new output unless user scrolls up
         self.system_prompt = base_prompt(skills_system_prompt(self.skills))
         self.history = [{"role": "system", "content": self.system_prompt}]
         self.refresh_system_prompt()
@@ -88,34 +108,117 @@ class OasysApp(App):
         yield Vertical(
             RichLog(id="log", wrap=True, highlight=True, markup=True, auto_scroll=True),
             Static("", id="status"),
-            Input(placeholder="oasys> (try /help)", id="prompt"),
+            TextArea(id="composer", theme="vscode_dark", text="",
+                     show_line_numbers=False, soft_wrap=True),
         )
 
+    # ------------------------------------------------------------- composer
     def on_mount(self) -> None:
         log = self.query_one("#log", RichLog)
         log.write(f"[#c15f3c]oasys[/] · {len(self.skills)} skills · {len(self.plugins)} plugins loaded")
         log.write("[#666666]/help for commands · /settings to configure · /goal to set objectives[/]")
+        log.write("[#666666]Enter sends · Shift+Enter newline · scroll chat freely · /stop to interrupt[/]")
         log.write("")
         if not keystore.get_key("OPENROUTER_API_KEY"):
             log.write("[#cc4444]No OPENROUTER_API_KEY set.[/] Run /key openrouter <your-key> or re-run: python -m oasys.setup_wizard")
         goals = settings_mod.get_goals()
         if goals:
-            log.write(f"[#666666]{len(goals)} standing goal(s) loaded — they guide /overnight work.[/]")
-        self.query_one("#prompt", Input).focus()
+            log.write(f"[#666666]{len(goals)} standing goal(s) loaded - they guide /overnight work.[/]")
+        self._resize_composer()
+        self.query_one("#composer", TextArea).focus()
         self.update_status()
 
+    def _resize_composer(self) -> None:
+        """Size the composer to its content (1..max lines) so new lines make
+        it grow; beyond max it gets a scrollbar."""
+        ta = self.query_one("#composer", TextArea)
+        lines = max(1, ta.document.line_count)
+        ta.styles.height = min(12, lines)
+
+    def on_descendant_key(self, event: events.Key) -> None:
+        """Enter submits (unless Shift is held, which inserts a newline).
+        This fires for the composer TextArea before it inserts the newline."""
+        if event.widget is not self.query_one("#composer", TextArea):
+            return
+        if event.key == "enter":
+            # Plain Enter submits; Shift+Enter is left to TextArea (newline).
+            event.prevent_default()
+            event.stop()
+            self.submit_composer()
+        else:
+            # Any other key may change the content height.
+            self._resize_composer()
+
+    async def on_key(self, event: events.Key) -> None:
+        # While a run is active, allow Enter/empty submission to interrupt.
+        pass
+
+    def submit_composer(self) -> None:
+        ta = self.query_one("#composer", TextArea)
+        text = ta.text
+        ta.clear()
+        self._resize_composer()
+        self.query_one("#composer", TextArea).focus()
+        self.handle_user_input(text)
+
+    def handle_user_input(self, user_text: str) -> None:
+        log = self.query_one("#log", RichLog)
+        user_text = (user_text or "").strip()
+        # Empty submission while a run is active = interrupt.
+        if self.running:
+            if user_text in ("", "/stop", "stop"):
+                self.request_interrupt()
+                log.write("[#c15f3c]interrupt requested - finishing current step...[/]")
+            else:
+                log.write("[#666666]run active - type /stop or press Enter to interrupt[/]")
+            return
+
+        if not user_text:
+            return
+
+        log.write(f"[#888888]>[/] {user_text}")
+
+        if user_text.startswith("/"):
+            parts = user_text.split(maxsplit=1)
+            cmd, args = parts[0], parts[1] if len(parts) > 1 else ""
+            if cmd == "/compact":
+                asyncio.ensure_future(self.do_compact(log))
+            elif cmd in ("/overnight",):
+                # overnight manages its own async task/flag
+                result = self.handle_overnight_command(args)
+                if result:
+                    log.write(result)
+                log.write("")
+            else:
+                result = self.handle_command(cmd, args)
+                if result:
+                    log.write(result)
+                log.write("")
+            return
+
+        self.history.append({"role": "user", "content": user_text})
+        asyncio.ensure_future(self.run_agent_loop(log))
+
+    def request_interrupt(self) -> None:
+        self.cancelled.set()
+        self.overnight_active = False
+
     def update_status(self) -> None:
-        base = self.stats.summary()
-        if self.overnight_active and self.overnight_end:
-            remaining = max(0, self.overnight_end - time.time())
-            hh, rem = divmod(int(remaining), 3600)
-            mm, ss = divmod(rem, 60)
-            base = f"[#c15f3c]OVERNIGHT {hh:02d}:{mm:02d}:{ss:02d}[/] " + base
-        self.query_one("#status", Static).update(base)
+        try:
+            base = self.stats.summary()
+            if self.overnight_active and self.overnight_end:
+                remaining = max(0, self.overnight_end - time.time())
+                hh, rem = divmod(int(remaining), 3600)
+                mm, ss = divmod(rem, 60)
+                base = f"[#c15f3c]OVERNIGHT {hh:02d}:{mm:02d}:{ss:02d}[/] " + base
+            elif self.running:
+                base = "[#c15f3c]RUNNING - Enter or /stop to interrupt[/] " + base
+            self.query_one("#status", Static).update(base)
+        except Exception:
+            # Widget may be torn down (app exiting) - ignore.
+            pass
 
     def refresh_system_prompt(self) -> None:
-        """Rebuild the system prompt so it reflects current goals, then patch
-        the system message at the head of the conversation history."""
         goals = settings_mod.get_goals()
         goal_block = ""
         if goals:
@@ -126,6 +229,13 @@ class OasysApp(App):
         self.system_prompt = base_prompt(skills_system_prompt(self.skills)) + goal_block
         if self.history and self.history[0].get("role") == "system":
             self.history[0] = {"role": "system", "content": self.system_prompt}
+
+    # ------------------------------------------------------- chat scrolling
+    def on_rich_log_scroll(self, event) -> None:
+        log = self.query_one("#log", RichLog)
+        at_bottom = (log.scroll_y >= log.max_scroll_y - 1)
+        self.auto_follow = at_bottom
+        log.auto_scroll = at_bottom
 
     # ---------------------------------------------------------------- commands
     def handle_plugin_command(self, args: str) -> str:
@@ -173,7 +283,7 @@ class OasysApp(App):
             lines = ["[#666666]configured providers (from config.yaml):[/]"]
             cfg = settings_mod.list_providers()
             if not cfg:
-                lines.append("  (none — only built-in providers available)")
+                lines.append("  (none - only built-in providers available)")
             for p in cfg:
                 lines.append(f"  [#c15f3c]{p.get('name')}[/]: {p.get('base_url')}  key={p.get('api_key_env')}")
             lines.append("[#666666]built-in providers:[/]")
@@ -234,7 +344,7 @@ class OasysApp(App):
         if not args.strip() or toks[0] == "list":
             goals = settings_mod.get_goals()
             if not goals:
-                return "[#666666]no goals set.[/] Use /goal <text> to add one — goals guide autonomous/overnight work."
+                return "[#666666]no goals set.[/] Use /goal <text> to add one - goals guide autonomous/overnight work."
             return (
                 "[#666666]goals:[/]\n" + "\n".join(f"  {i}. {g}" for i, g in enumerate(goals, 1)) +
                 "\n\n[#666666]  /goal remove <n>  |  /goal clear[/]"
@@ -254,7 +364,7 @@ class OasysApp(App):
 
     def handle_overnight_command(self, args: str) -> str:
         if self.overnight_active:
-            return "[#cc4444]overnight already running — type /stop to halt[/]"
+            return "[#cc4444]overnight already running - type /stop to halt[/]"
         if not args.strip():
             return "[#cc4444]usage: /overnight <duration>  e.g. /overnight 5h, /overnight 30m, /overnight 1h30m, /overnight 2d[/]"
         try:
@@ -272,17 +382,18 @@ class OasysApp(App):
             )
         self.overnight_active = True
         self.overnight_end = time.time() + secs
+        self.cancelled.clear()
         self.overnight_task = asyncio.ensure_future(self.run_overnight(secs))
         return (
-            f"[#c15f3c]overnight started[/] — autonomous for ~{secs/3600:.2f}h ({(secs//60):.0f} min). "
+            f"[#c15f3c]overnight started[/] - autonomous for ~{secs/3600:.2f}h ({(secs//60):.0f} min). "
             f"Type /stop to halt. Goals loaded: {len(goals)}"
         )
 
     def handle_stop_command(self) -> str:
-        if not self.overnight_active:
-            return "[#666666]overnight is not running[/]"
-        self.overnight_active = False
-        return "[#c15f3c]stopping overnight after the current step...[/]"
+        if not (self.overnight_active or self.cancelled.is_set()):
+            return "[#666666]no run is in progress[/]"
+        self.request_interrupt()
+        return "[#c15f3c]stopping after the current step...[/]"
 
     def handle_command(self, cmd: str, args: str) -> str | None:
         if cmd == "/help":
@@ -292,13 +403,13 @@ class OasysApp(App):
                 "[#c15f3c]/plugins[/] list loaded plugins\n"
                 "[#c15f3c]/run <plugin> [args][/] execute a plugin\n"
                 "[#c15f3c]/model[/] show current model list\n"
-                "[#c15f3c]/clear[/] reset conversation history\n"
+                "[#c15f3c]/clear[/] reset conversation\n"
                 "[#c15f3c]/compact[/] summarize history to save context\n"
                 "[#c15f3c]/settings[/] view/change config (set/get/add provider/remove provider/providers)\n"
                 "[#c15f3c]/key <provider> <api_key>[/] save API key (persists to .env)\n"
                 "[#c15f3c]/goal <text>[/] set a standing objective (also: /goal list|remove <n>|clear)\n"
                 "[#c15f3c]/overnight <duration>[/] run autonomously, e.g. /overnight 5h\n"
-                "[#c15f3c]/stop[/] halt an /overnight run\n"
+                "[#c15f3c]/stop[/] halt an in-flight run\n"
                 "[#c15f3c]/plugin marketplace add <owner/repo>[/] add a marketplace\n"
                 "[#c15f3c]/plugin install <name>@<alias>[/] install a skill/plugin\n"
                 "[#c15f3c]/plugin marketplace list[/] show added marketplaces"
@@ -306,11 +417,11 @@ class OasysApp(App):
         if cmd == "/skills":
             if not self.skills:
                 return "[#666666]No skills found in oasys/skills[/]"
-            return "\n".join(f"[#c15f3c]{s.name}[/] — {s.description or '(no description)'}" for s in self.skills)
+            return "\n".join(f"[#c15f3c]{s.name}[/] - {s.description or '(no description)'}" for s in self.skills)
         if cmd == "/plugins":
             if not self.plugins:
                 return "[#666666]No plugins found in oasys/plugins[/]"
-            return "\n".join(f"[#c15f3c]{p.name}[/] — {p.description}" for p in self.plugins.values())
+            return "\n".join(f"[#c15f3c]{p.name}[/] - {p.description}" for p in self.plugins.values())
         if cmd == "/plugin":
             return self.handle_plugin_command(args)
         if cmd == "/settings":
@@ -345,40 +456,6 @@ class OasysApp(App):
             return "[#666666]conversation cleared[/]"
         return f"[#cc4444]unknown command: {cmd}[/] (try /help)"
 
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
-        log = self.query_one("#log", RichLog)
-        prompt_box = self.query_one("#prompt", Input)
-        user_text = event.value.strip()
-        prompt_box.value = ""
-        if not user_text:
-            return
-
-        # While overnight mode runs, only /stop is accepted.
-        if self.overnight_active:
-            if user_text in ("/stop", "stop"):
-                self.overnight_active = False
-                log.write("[#c15f3c]stop requested — finishing current step...[/]")
-            else:
-                log.write("[#666666]overnight mode active — type /stop to halt[/]")
-            return
-
-        log.write(f"[#888888]>[/] {user_text}")
-
-        if user_text.startswith("/"):
-            parts = user_text.split(maxsplit=1)
-            cmd, args = parts[0], parts[1] if len(parts) > 1 else ""
-            if cmd == "/compact":
-                await self.do_compact(log)
-            else:
-                result = self.handle_command(cmd, args)
-                if result:
-                    log.write(result)
-                log.write("")
-            return
-
-        self.history.append({"role": "user", "content": user_text})
-        await self.run_agent_loop(log)
-
     async def do_compact(self, log: RichLog) -> None:
         log.write("[#666666]compacting conversation...[/]")
         summary_request = self.history + [{
@@ -405,10 +482,10 @@ class OasysApp(App):
         if goals:
             goal_block = "\n".join(f"  - {g}" for g in goals)
         else:
-            goal_block = ("  (none set — improve the codebase: fix bugs, add/extend tests, "
+            goal_block = ("  (none set - improve the codebase: fix bugs, add/extend tests, "
                           "improve docs, refactor, add small robustness features)")
         return (
-            f"[AUTONOMOUS OVERNIGHT MODE — iteration {iteration}]\n"
+            f"[AUTONOMOUS OVERNIGHT MODE - iteration {iteration}]\n"
             "You are operating with NO human in the loop. Continue the project autonomously.\n"
             f"Standing goal(s):\n{goal_block}\n\n"
             "For this iteration, without asking the user:\n"
@@ -428,6 +505,7 @@ class OasysApp(App):
         iteration = 0
         compact_every = max(1, int(settings_mod.load().get("overnight_compact_every", 5) or 5))
         log.write(f"[#c15f3c]=== OVERNIGHT MODE STARTED (~{duration_sec/60:.0f}m) ===[/]")
+        self.running = True
         try:
             while time.time() < end and self.overnight_active:
                 iteration += 1
@@ -439,6 +517,8 @@ class OasysApp(App):
                     await self.run_agent_loop(log)
                 except Exception as e:
                     log.write(f"[#cc4444]overnight iteration error:[/] {e}")
+                if self.cancelled.is_set():
+                    break
                 if iteration % compact_every == 0:
                     log.write("[#666666]overnight compaction...[/]")
                     try:
@@ -448,6 +528,8 @@ class OasysApp(App):
                 await asyncio.sleep(0.5)
         finally:
             self.overnight_active = False
+            self.cancelled.clear()
+            self.running = False
             self.overnight_end = 0.0
             log.write("[#c15f3c]=== OVERNIGHT MODE ENDED ===[/]")
             self.update_status()
@@ -465,73 +547,116 @@ class OasysApp(App):
         remaining = SHELL_PATTERN.sub("", remaining)
         return remaining.strip(), actions
 
+    def check_interrupt(self) -> bool:
+        """Return True if the user requested an interrupt; clears the flag."""
+        if self.cancelled.is_set():
+            self.cancelled.clear()
+            return True
+        return False
+
     async def run_agent_loop(self, log: RichLog) -> None:
         config = settings_mod.load()
         max_steps = config.get("max_agent_steps", 25)
+        self.cancelled.clear()
+        self.running = True
+        self.update_status()
 
-        for step in range(max_steps):
-            start = time.perf_counter()
-            model_used = "?"
-            full_text = ""
-            usage = {}
+        try:
+            for step in range(max_steps):
+                if self.check_interrupt():
+                    log.write("[#c15f3c]interrupted.[/]")
+                    return
 
-            try:
-                async for chunk, done, u, model in route_stream(self.history):
-                    model_used = model
-                    if chunk:
-                        full_text += chunk
-                    if u:
-                        usage = u
-                    if done:
-                        break
-            except Exception as e:
-                log.write(f"[#cc4444]error:[/] {e}")
-                log.write("")
-                return
+                start = time.perf_counter()
+                model_used = "?"
+                full_text = ""
+                usage = {}
 
-            elapsed = time.perf_counter() - start
-            self.stats.record(usage)
-            self.update_status()
+                try:
+                    async for chunk, done, u, model in route_stream(self.history):
+                        model_used = model
+                        if chunk:
+                            full_text += chunk
+                        if u:
+                            usage = u
+                        if done:
+                            break
+                        if self.cancelled.is_set():
+                            break
+                except asyncio.CancelledError:
+                    # Task was cancelled (app closing or interrupted) - stop cleanly.
+                    return
+                except Exception as e:
+                    log.write(f"[#cc4444]error:[/] {e}")
+                    log.write("")
+                    return
 
-            self.history.append({"role": "assistant", "content": full_text})
-            display_text, actions = self.extract_actions(full_text)
+                # If interrupted mid-stream, show what we have and stop.
+                if self.cancelled.is_set():
+                    full_text += " [interrupted]"
+                    self.history.append({"role": "assistant", "content": full_text})
+                    display, actions = self.extract_actions(full_text)
+                    if display:
+                        log.write(f"[#c15f3c]oasys[/] [#666666]({model_used})[/]")
+                        log.write(Markdown(display))
+                    log.write("[#c15f3c]interrupted.[/]")
+                    self.cancelled.clear()
+                    return
 
-            if display_text:
-                log.write(f"[#c15f3c]oasys[/] [#666666]({model_used})[/]")
-                log.write(Markdown(display_text))
+                elapsed = time.perf_counter() - start
+                self.stats.record(usage)
+                self.update_status()
 
-            if not actions:
+                self.history.append({"role": "assistant", "content": full_text})
+                display_text, actions = self.extract_actions(full_text)
+
+                if display_text:
+                    log.write(f"[#c15f3c]oasys[/] [#666666]({model_used})[/]")
+                    log.write(Markdown(display_text))
+
+                if not actions:
+                    tok = usage.get("total_tokens", "?")
+                    log.write(f"[#444444]{elapsed:.1f}s · {tok} tokens[/]")
+                    log.write("")
+                    return
+
+                outputs = []
+                for kind, target, content in actions:
+                    if kind == "shell":
+                        log.write(f"[#c15f3c]$[/] {target}")
+                        out = await run_shell(target)
+                        log.write(f"[#666666]{out}[/]")
+                        outputs.append(f"$ {target}\n{out}")
+                    elif kind == "read":
+                        log.write(f"[#c15f3c]read[/] {target}")
+                        out = read_file(target)
+                        preview = out if len(out) < 2000 else out[:2000] + "\n...[truncated]"
+                        log.write(f"[#666666]{preview}[/]")
+                        outputs.append(f"[read {target}]\n{out}")
+                    elif kind == "edit":
+                        diff, msg = write_file(target, content)
+                        log.write(f"[#c15f3c]edit[/] {target}")
+                        log.write(Text(diff, style="#888888"))
+                        log.write(f"[#666666]{msg}[/]")
+                        outputs.append(f"[edit {target}]\n{msg}")
+
+                    # Check for interrupt between tool calls so we don't hang
+                    # through a long sequence of actions.
+                    if self.check_interrupt():
+                        log.write("[#c15f3c]interrupted.[/]")
+                        self.history.append({"role": "user", "content": "[action results]\n" + "\n\n".join(outputs)})
+                        return
+
                 tok = usage.get("total_tokens", "?")
                 log.write(f"[#444444]{elapsed:.1f}s · {tok} tokens[/]")
-                log.write("")
-                return
+                self.history.append({"role": "user", "content": "[action results]\n" + "\n\n".join(outputs)})
 
-            outputs = []
-            for kind, target, content in actions:
-                if kind == "shell":
-                    log.write(f"[#c15f3c]$[/] {target}")
-                    out = await run_shell(target)
-                    log.write(f"[#666666]{out}[/]")
-                    outputs.append(f"$ {target}\n{out}")
-                elif kind == "read":
-                    log.write(f"[#c15f3c]read[/] {target}")
-                    out = read_file(target)
-                    preview = out if len(out) < 2000 else out[:2000] + "\n...[truncated]"
-                    log.write(f"[#666666]{preview}[/]")
-                    outputs.append(f"[read {target}]\n{out}")
-                elif kind == "edit":
-                    diff, msg = write_file(target, content)
-                    log.write(f"[#c15f3c]edit[/] {target}")
-                    log.write(Text(diff, style="#888888"))
-                    log.write(f"[#666666]{msg}[/]")
-                    outputs.append(f"[edit {target}]\n{msg}")
-
-            tok = usage.get("total_tokens", "?")
-            log.write(f"[#444444]{elapsed:.1f}s · {tok} tokens[/]")
-            self.history.append({"role": "user", "content": "[action results]\n" + "\n\n".join(outputs)})
-
-        log.write(f"[#cc4444]stopped: hit {max_steps}-step limit for this turn (change with /settings set max_agent_steps N)[/]")
-        log.write("")
+            log.write(f"[#cc4444]stopped: hit {max_steps}-step limit for this turn (change with /settings set max_agent_steps N)[/]")
+            log.write("")
+        finally:
+            self.cancelled.clear()
+            self.running = False
+            self.update_status()
 
 
 def main() -> None:
