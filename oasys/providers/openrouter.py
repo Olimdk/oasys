@@ -1,0 +1,95 @@
+"""OpenRouter provider — fetches the live list of free models, supports streaming."""
+import os
+import time
+import json
+import httpx
+from dotenv import load_dotenv
+from .base import Provider
+
+load_dotenv()
+
+_CACHE = {"models": [], "ts": 0}
+CACHE_TTL = 3600
+
+
+class OpenRouterProvider(Provider):
+    name = "openrouter"
+
+    def __init__(self):
+        self.api_key = os.getenv("OPENROUTER_API_KEY")
+        if not self.api_key:
+            raise RuntimeError(
+                "OPENROUTER_API_KEY not set. Copy .env.example to .env and add your key."
+            )
+        self.base_url = "https://openrouter.ai/api/v1"
+
+    def free_models(self) -> list[str]:
+        now = time.time()
+        if _CACHE["models"] and now - _CACHE["ts"] < CACHE_TTL:
+            return _CACHE["models"]
+        try:
+            resp = httpx.get(
+                f"{self.base_url}/models",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            all_models = resp.json()["data"]
+            free = [m["id"] for m in all_models if m["id"].endswith(":free")]
+            if free:
+                _CACHE["models"] = free
+                _CACHE["ts"] = now
+                return free
+        except Exception:
+            pass
+        return _CACHE["models"] or ["meta-llama/llama-3.3-70b-instruct:free"]
+
+    async def complete(self, messages: list[dict], model: str) -> dict:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{self.base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"model": model, "messages": messages},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return {
+                "content": data["choices"][0]["message"]["content"],
+                "model_used": model,
+                "usage": data.get("usage", {}),
+            }
+
+    async def stream_complete(self, messages: list[dict], model: str):
+        async with httpx.AsyncClient(timeout=30) as client:
+            async with client.stream(
+                "POST",
+                f"{self.base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"model": model, "messages": messages, "stream": True},
+            ) as resp:
+                resp.raise_for_status()
+                usage = {}
+                async for line in resp.aiter_lines():
+                    if not line or not line.startswith("data: "):
+                        continue
+                    payload = line[len("data: "):].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(payload)
+                    except Exception:
+                        continue
+                    if obj.get("usage"):
+                        usage = obj["usage"]
+                    choices = obj.get("choices", [])
+                    if choices:
+                        content = choices[0].get("delta", {}).get("content")
+                        if content:
+                            yield content, False, {}
+                yield "", True, usage

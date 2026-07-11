@@ -1,0 +1,5 @@
+textual>=0.58
+rich
+httpx
+pyyaml
+python-dotenv
