@@ -40,6 +40,21 @@ READ_PATTERN = re.compile(r"^READ:\s*(\S+)\s*$", re.MULTILINE)
 SHELL_PATTERN = re.compile(r"^SHELL:\s*(.+)$", re.MULTILINE)
 
 
+class Composer(TextArea):
+    """Multi-line input box. Enter submits; Shift+Enter (or Ctrl+J as a
+    terminal-safe fallback) inserts a newline instead."""
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key == "enter":
+            event.prevent_default()
+            event.stop()
+            self.app.submit_composer()
+        elif event.key == "ctrl+j":
+            event.prevent_default()
+            event.stop()
+            self.insert("\n")
+
+
 def parse_duration(text: str) -> float:
     """Parse a duration like '5h', '30m', '90m', '1h30m', '45s', '2d', or a
     bare number (interpreted as minutes). Returns seconds (float)."""
@@ -76,10 +91,7 @@ class OasysApp(App):
         padding: 0 1;
     }
     #composer:focus { border: solid #c15f3c; }
-    #composer TextArea {
-        background: #0c0c0c;
-        border: none;
-        padding: 0;
+    #composer {
         color: #e0e0e0;
     }
     """
@@ -108,7 +120,7 @@ class OasysApp(App):
         yield Vertical(
             RichLog(id="log", wrap=True, highlight=True, markup=True, auto_scroll=True),
             Static("", id="status"),
-            TextArea(id="composer", theme="vscode_dark", text="",
+            Composer(id="composer", theme="vscode_dark", text="",
                      show_line_numbers=False, soft_wrap=True),
         )
 
@@ -130,28 +142,20 @@ class OasysApp(App):
 
     def _resize_composer(self) -> None:
         """Size the composer to its content (1..max lines) so new lines make
-        it grow; beyond max it gets a scrollbar."""
+        it grow; beyond max it gets a scrollbar.
+
+        +2 accounts for the composer's own top+bottom border: `height` sets
+        the border-box, so without this the border rows eat into the
+        content area and, at small sizes, leave zero rows for the text
+        itself (it's still there, just rendered with no visible space)."""
         ta = self.query_one("#composer", TextArea)
         lines = max(1, ta.document.line_count)
-        ta.styles.height = min(12, lines)
+        ta.styles.height = min(12, lines + 2)
 
-    def on_descendant_key(self, event: events.Key) -> None:
-        """Enter submits (unless Shift is held, which inserts a newline).
-        This fires for the composer TextArea before it inserts the newline."""
-        if event.widget is not self.query_one("#composer", TextArea):
-            return
-        if event.key == "enter":
-            # Plain Enter submits; Shift+Enter is left to TextArea (newline).
-            event.prevent_default()
-            event.stop()
-            self.submit_composer()
-        else:
-            # Any other key may change the content height.
+    def on_text_area_changed(self, event) -> None:
+        # Any content change may change the composer's required height.
+        if event.text_area.id == "composer":
             self._resize_composer()
-
-    async def on_key(self, event: events.Key) -> None:
-        # While a run is active, allow Enter/empty submission to interrupt.
-        pass
 
     def submit_composer(self) -> None:
         ta = self.query_one("#composer", TextArea)

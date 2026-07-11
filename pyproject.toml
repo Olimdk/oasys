@@ -27,7 +27,7 @@ Repository = "https://github.com/Olimdk/oasys"
 oasys = "oasys.app:main"
 
 [tool.setuptools]
-packages = ["oasys"]
+packages = ["oasys", "oasys.providers"]
 
 [tool.setuptools.package-data]
 oasys = [
