@@ -1,12 +1,9 @@
 """OpenRouter provider — fetches the live list of free models, supports streaming."""
-import os
 import time
 import json
 import httpx
-from dotenv import load_dotenv
 from .base import Provider
-
-load_dotenv()
+from ..keystore import get_key
 
 _CACHE = {"models": [], "ts": 0}
 CACHE_TTL = 3600
@@ -16,10 +13,11 @@ class OpenRouterProvider(Provider):
     name = "openrouter"
 
     def __init__(self):
-        self.api_key = os.getenv("OPENROUTER_API_KEY")
+        self.api_key = get_key("OPENROUTER_API_KEY")
         if not self.api_key:
             raise RuntimeError(
-                "OPENROUTER_API_KEY not set. Copy .env.example to .env and add your key."
+                "OPENROUTER_API_KEY not set. Run /key openrouter <key> or copy "
+                ".env.example to .env and add your key."
             )
         self.base_url = "https://openrouter.ai/api/v1"
 

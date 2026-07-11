@@ -16,8 +16,9 @@ from oasys.files import read_file, write_file
 from oasys.session import SessionStats
 from oasys import marketplace
 from oasys import settings as settings_mod
+from oasys import keystore
 
-COMMANDS = ["/help", "/skills", "/plugins", "/run", "/model", "/clear", "/compact", "/plugin", "/settings"]
+COMMANDS = ["/help", "/skills", "/plugins", "/run", "/model", "/clear", "/compact", "/plugin", "/settings", "/key"]
 
 EDIT_PATTERN = re.compile(r"EDIT:\s*(\S+)\s*\n```[a-zA-Z0-9_+-]*\n(.*?)```", re.DOTALL)
 READ_PATTERN = re.compile(r"^READ:\s*(\S+)\s*$", re.MULTILINE)
@@ -67,6 +68,8 @@ class OasysApp(App):
         log.write(f"[#c15f3c]oasys[/] · {len(self.skills)} skills · {len(self.plugins)} plugins loaded")
         log.write("[#666666]/help for commands · /settings to configure[/]")
         log.write("")
+        if not keystore.get_key("OPENROUTER_API_KEY"):
+            log.write("[#cc4444]No OPENROUTER_API_KEY set.[/] Run /key openrouter <your-key> or re-run: python -m oasys.setup_wizard")
         self.query_one("#prompt", Input).focus()
         self.update_status()
 
@@ -103,6 +106,23 @@ class OasysApp(App):
             new_config = settings_mod.set_key(key, value)
             return f"[#666666]updated:[/] {key} = {value}\n\n" + settings_mod.render(new_config)
         return "[#cc4444]usage: /settings  |  /settings set <key> <value>[/]"
+    def handle_key_command(self, args: str) -> str:
+        if not args.strip() or args.strip() == "status":
+            st = keystore.key_status()
+            lines = [f"[#666666]{k}:[/] {v if v else '[#cc4444]not set[/]'}" for k, v in st.items()]
+            return (
+                "[#666666]API key status:[/]\n"
+                + "\n".join(lines)
+                + "\n\n[#666666]set a key with: /key <provider> <key>[/]\n"
+                + "[#666666]e.g. /key openrouter sk-or-...[/]"
+            )
+        parts = args.split(maxsplit=1)
+        if len(parts) < 2:
+            return "[#cc4444]usage: /key <provider> <api_key>  |  /key status[/]"
+        provider, api_key = parts[0], parts[1].strip()
+        env_var = f"{provider.upper()}_API_KEY"
+        keystore.set_key(env_var, api_key)
+        return f"[#666666]saved[/] {env_var} -> .env (persisted across restarts)."
 
     def handle_command(self, cmd: str, args: str) -> str | None:
         if cmd == "/help":
@@ -115,6 +135,7 @@ class OasysApp(App):
                 "[#c15f3c]/clear[/] reset conversation history\n"
                 "[#c15f3c]/compact[/] summarize history to save context\n"
                 "[#c15f3c]/settings[/] view/change config (steps, voice, provider)\n"
+                "[#c15f3c]/key <provider> <api_key>[/] save API key (persists to .env)\n"
                 "[#c15f3c]/plugin marketplace add <owner/repo>[/] add a marketplace\n"
                 "[#c15f3c]/plugin install <name>@<alias>[/] install a skill/plugin\n"
                 "[#c15f3c]/plugin marketplace list[/] show added marketplaces"
@@ -131,6 +152,8 @@ class OasysApp(App):
             return self.handle_plugin_command(args)
         if cmd == "/settings":
             return self.handle_settings_command(args)
+        if cmd == "/key":
+            return self.handle_key_command(args)
         if cmd == "/run":
             parts = args.split(maxsplit=1)
             if not parts:
