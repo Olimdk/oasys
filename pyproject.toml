@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oasys"
+version = "0.2.0"
+description = "OASYS - a local autonomous coding assistant with a Claude Code-style TUI, free-model fallback, and autonomous /overnight mode."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Olimdk" }]
+keywords = ["ai", "coding-assistant", "cli", "tui", "agent", "autonomous"]
+dependencies = [
+    "textual>=0.58",
+    "rich",
+    "httpx",
+    "pyyaml",
+    "python-dotenv",
+]
+
+[project.urls]
+Homepage = "https://github.com/Olimdk/oasys"
+Repository = "https://github.com/Olimdk/oasys"
+
+[project.scripts]
+oasys = "oasys.app:main"
+
+[tool.setuptools]
+packages = ["oasys"]
+
+[tool.setuptools.package-data]
+oasys = [
+    "skills/*/SKILL.md",
+    "skills/*/*",
+    "plugins/*.py",
+    "config_default.yaml",
+]

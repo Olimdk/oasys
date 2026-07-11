@@ -1,7 +1,8 @@
 """Marketplace: clone GitHub repos of skills/plugins, install by name.
 
-OASYS is self-contained: skills install into oasys/skills/ and plugins into
-oasys/plugins/ (no ~/.claude / Claude Code dependency).
+Bundled skills/plugins ship with the package; marketplace installs go into the
+user-writable OASYS_HOME/skills and OASYS_HOME/plugins directories so a
+read-only package install still supports extensions.
 
 Usage (from the OASYS prompt):
   /plugin marketplace add jeffallan/claude-skills
@@ -12,13 +13,13 @@ import subprocess
 import shutil
 import yaml
 from pathlib import Path
+from oasys import OASYS_HOME
 
-OASYS_HOME = Path.home() / ".oasys"
 MARKETPLACES_DIR = OASYS_HOME / "marketplaces"
 REGISTRY_FILE = OASYS_HOME / "marketplaces.yaml"
-# Install targets are OASYS-local (no Claude Code dependency).
-OASYS_SKILLS_DIR = Path(__file__).parent / "skills"
-OASYS_PLUGINS_DIR = Path(__file__).parent / "plugins"
+# Install targets are user-writable (no package-dir writes needed).
+OASYS_SKILLS_DIR = OASYS_HOME / "skills"
+OASYS_PLUGINS_DIR = OASYS_HOME / "plugins"
 
 
 def _load_registry() -> dict:
@@ -67,7 +68,7 @@ def marketplace_list() -> str:
     reg = _load_registry()
     if not reg:
         return "[no marketplaces added yet]"
-    return "\n".join(f"{alias} — {info['url']}" for alias, info in reg.items())
+    return "\n".join(f"{alias} - {info['url']}" for alias, info in reg.items())
 
 
 def _find_item(marketplace_path: Path, item_name: str) -> Path | None:

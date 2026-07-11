@@ -1,32 +1,20 @@
-"""First-run setup: writes .env (API key) and config.yaml.
+"""First-run setup: writes config + .env into the user OASYS_HOME directory.
 
 Can run interactively, or non-interactively when OASYS_PROVIDER and
 OASYS_API_KEY environment variables are supplied (used by install.sh).
 """
 import os
-from pathlib import Path
-from oasys.keystore import set_key, env_var_for
+from oasys import OASYS_HOME, settings as settings_mod
+from oasys import keystore
 
-ROOT = Path(__file__).parent.parent
-CONFIG_PATH = ROOT / "config.yaml"
-
-DEFAULT_CONFIG = (
-    "provider: openrouter\n"
-    "models: []\n"
-    "max_agent_steps: 150\n"
-    "show_live_stream: false\n"
-    "voice:\n"
-    "  input_enabled: false\n"
-    "  output_enabled: false\n"
-    "  tts_provider: none\n"
-)
+CONFIG_PATH = settings_mod.CONFIG_PATH
 
 
 def write_config(provider: str) -> None:
     # Never clobber an existing config (preserves user customizations).
     if CONFIG_PATH.exists():
         return
-    CONFIG_PATH.write_text(DEFAULT_CONFIG)
+    settings_mod.save(settings_mod.load())
     print(f"Wrote {CONFIG_PATH}")
 
 
@@ -41,11 +29,11 @@ def main() -> None:
         key = input(f"API key for {provider}: ").strip()
 
     if key:
-        env_var = env_var_for(provider)
-        set_key(env_var, key)
-        print(f"Saved {env_var} to {ROOT / '.env'} (persisted).")
+        env_var = keystore.env_var_for(provider)
+        keystore.set_key(env_var, key)
+        print(f"Saved {env_var} to {keystore.ENV_PATH} (persisted).")
     else:
-        print("No API key provided — set one later with: /key <provider> <key>")
+        print("No API key provided - set one later with: /key <provider> <key>")
 
     write_config(provider)
     print("\nDone. Run: oasys   (or: python -m oasys.app)")

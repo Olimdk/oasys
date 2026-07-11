@@ -1,0 +1,12 @@
+# Default OASYS configuration. Copied to ~/.oasys/config.yaml on first run.
+provider: openrouter
+models: []
+max_agent_steps: 150
+show_live_stream: false
+voice:
+  input_enabled: false
+  output_enabled: false
+  tts_provider: none
+overnight_compact_every: 5
+providers: []
+goals: []

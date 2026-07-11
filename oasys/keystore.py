@@ -1,14 +1,15 @@
-"""Read/write provider API keys in the project .env file.
+"""Read/write provider API keys in the user .env file inside OASYS_HOME.
 
-The .env file lives at the project root and is gitignored, so keys never
-get committed. Use set_key() to persist a key the user inserts (e.g. via
+The .env file lives in ~/.oasys (or $OASYS_HOME) and is gitignored, so keys
+never get committed. Use set_key() to persist a key the user inserts (e.g. via
 the /key command) and get_key() to read it back.
 """
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+from oasys import OASYS_HOME
 
-ENV_PATH = Path(__file__).parent.parent / ".env"
+ENV_PATH = OASYS_HOME / ".env"
 
 # Map of provider name -> env var that holds its API key.
 KNOWN_PROVIDERS = {
@@ -34,6 +35,7 @@ def set_key(name: str, value: str) -> Path:
     The value is also exported into the current process environment so the
     change takes effect immediately without a restart.
     """
+    OASYS_HOME.mkdir(parents=True, exist_ok=True)
     text = ""
     found = False
     if ENV_PATH.exists():
@@ -61,7 +63,7 @@ def key_status() -> dict:
     out = {}
     for var in KNOWN_PROVIDERS.values():
         val = os.getenv(var)
-        out[var] = ("…" + val[-4:]) if val else None
+        out[var] = ("..." + val[-4:]) if val else None
     return out
 
 

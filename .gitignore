@@ -5,5 +5,13 @@ __pycache__/
 *.pyc
 .DS_Store
 
+# user data dir (created at runtime)
+.oasys/
+
+# build artifacts
+dist/
+build/
+*.egg-info/
+
 # stray empty scratch file
 .v.py

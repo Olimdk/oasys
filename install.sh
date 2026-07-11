@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# OASYS one-command installer.
+# OASYS one-command installer (installs the package into a venv).
 #   curl -fsSL https://raw.githubusercontent.com/Olimdk/oasys/main/install.sh | bash
 #
 # Environment overrides:
 #   OASYS_HOME     install directory   (default: ~/.local/share/oasys)
 #   OASYS_BRANCH   git branch to clone (default: main)
-#   OASYS_PROVIDER provider name       (default: openrouter)  — used with OASYS_API_KEY
+#   OASYS_PROVIDER provider name       (default: openrouter)  - used with OASYS_API_KEY
 #   OASYS_API_KEY  API key             (optional; prompted if omitted)
 #
 set -euo pipefail
@@ -39,18 +39,18 @@ fi
 
 cd "$OASYS_HOME"
 
-# --- virtualenv + dependencies ---
+# --- virtualenv + install the package ---
 if [ ! -d venv ]; then
   python3 -m venv venv
 fi
 # shellcheck disable=SC1091
 source venv/bin/activate
 pip install --quiet --upgrade pip
-pip install --quiet -r requirements.txt
+pip install --quiet .
 
 # --- API key / config (only if missing) ---
-if [ ! -f .env ] || [ ! -f config.yaml ]; then
-  if [ ! -f .env ]; then
+if [ ! -f "$HOME/.oasys/.env" ] || [ ! -f "$HOME/.oasys/config.yaml" ]; then
+  if [ ! -f "$HOME/.oasys/.env" ]; then
     if [ -z "${OASYS_API_KEY:-}" ]; then
       read -r -p "Provider [openrouter]: " PROV
       PROV="${PROV:-openrouter}"
@@ -66,22 +66,15 @@ if [ ! -f .env ] || [ ! -f config.yaml ]; then
   fi
 fi
 
-# --- launcher ---
-LAUNCHER="$OASYS_HOME/oasys.sh"
-cat > "$LAUNCHER" <<'EOF'
-#!/usr/bin/env bash
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-exec "$SCRIPT_DIR/venv/bin/python" -m oasys.app "$@"
-EOF
-chmod +x "$LAUNCHER"
-
+# --- launcher (the package provides a console script: venv/bin/oasys) ---
+LAUNCHER_SRC="$OASYS_HOME/venv/bin/oasys"
 if [ -w /usr/local/bin ]; then
-  ln -sf "$LAUNCHER" /usr/local/bin/oasys
+  ln -sf "$LAUNCHER_SRC" /usr/local/bin/oasys
   echo "==> installed launcher: /usr/local/bin/oasys"
 else
   BIN_DIR="$HOME/.local/bin"
   mkdir -p "$BIN_DIR"
-  ln -sf "$LAUNCHER" "$BIN_DIR/oasys"
+  ln -sf "$LAUNCHER_SRC" "$BIN_DIR/oasys"
   if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
     echo
     echo "NOTE: $BIN_DIR is not on your PATH. Add it with:"
@@ -94,5 +87,4 @@ fi
 echo
 echo "==> OASYS installed."
 echo "    Run it with:  oasys"
-echo "    Or directly:  $LAUNCHER"
 echo "    First run opens the TUI. Set a key anytime with:  /key openrouter <key>"

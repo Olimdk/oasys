@@ -1,15 +1,15 @@
 """Discovers and loads SKILL.md files (OASYS-local format).
 
-OASYS is fully self-contained: skills live in oasys/skills/ only.
-It does NOT read from ~/.claude (Claude Code) so the assistant has no
-dependency on Claude Code being installed.
+Skills ship bundled inside the package AND can be installed by the user into
+the OASYS_HOME/skills directory (so a read-only package install still works).
 """
 from pathlib import Path
 from dataclasses import dataclass
+from oasys import OASYS_HOME
 
-SKILLS_DIRS = [
-    Path(__file__).parent / "skills",
-]
+BUNDLED_SKILLS = Path(__file__).parent / "skills"
+USER_SKILLS = OASYS_HOME / "skills"
+SKILLS_DIRS = [BUNDLED_SKILLS, USER_SKILLS]
 
 
 @dataclass
