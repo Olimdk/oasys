@@ -1,9 +1,4 @@
-"""Read/write provider API keys in the user .env file inside OASYS_HOME.
-
-The .env file lives in ~/.oasys (or $OASYS_HOME) and is gitignored, so keys
-never get committed. Use set_key() to persist a key the user inserts (e.g. via
-the /key command) and get_key() to read it back.
-"""
+"""Read/write provider API keys in the user .env file inside OASYS_HOME."""
 import os
 from pathlib import Path
 from dotenv import load_dotenv
@@ -11,14 +6,12 @@ from oasys import OASYS_HOME
 
 ENV_PATH = OASYS_HOME / ".env"
 
-# Map of provider name -> env var that holds its API key.
 KNOWN_PROVIDERS = {
     "openrouter": "OPENROUTER_API_KEY",
 }
 
 
 def load_env() -> None:
-    """Load .env into os.environ (idempotent; does not clobber existing vars)."""
     load_dotenv(ENV_PATH)
 
 
@@ -28,13 +21,6 @@ def get_key(name: str) -> str | None:
 
 
 def set_key(name: str, value: str) -> Path:
-    """Persist or update ``name=value`` in the project .env file.
-
-    Existing lines (including comments) are preserved; only the matching
-    key is replaced, or a new line is appended if it does not exist.
-    The value is also exported into the current process environment so the
-    change takes effect immediately without a restart.
-    """
     OASYS_HOME.mkdir(parents=True, exist_ok=True)
     text = ""
     found = False
@@ -58,10 +44,19 @@ def set_key(name: str, value: str) -> Path:
 
 
 def key_status() -> dict:
-    """Return a mapping of known env vars to a masked value or None."""
+    """Return a mapping of env var -> masked value for every known provider key."""
     load_env()
+    names = set(KNOWN_PROVIDERS.values())
+    try:
+        from oasys import settings as settings_mod
+        for p in settings_mod.list_providers():
+            env = p.get("api_key_env")
+            if env:
+                names.add(env)
+    except Exception:
+        pass
     out = {}
-    for var in KNOWN_PROVIDERS.values():
+    for var in sorted(names):
         val = os.getenv(var)
         out[var] = ("..." + val[-4:]) if val else None
     return out

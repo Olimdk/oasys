@@ -2,7 +2,6 @@
 
 UX:
 - Multi-line composer (TextArea): Enter submits, Shift+Enter inserts a newline.
-  The box auto-grows and gets its own scrollbar if it exceeds max height.
 - The chat (RichLog) keeps following new output, but if you scroll up it stops
   auto-following so you can read; it resumes following when you return to the
   bottom (or when a new submission starts).
@@ -10,8 +9,10 @@ UX:
   /stop (or just pressing Enter in an empty composer while a run is active).
 """
 import re
+import os
 import time
 import asyncio
+from pathlib import Path
 from textual.app import App, ComposeResult
 from textual.widgets import TextArea, Static, RichLog
 from textual.containers import Vertical
@@ -19,6 +20,7 @@ from textual import events
 from rich.markdown import Markdown
 from rich.text import Text
 
+from oasys import OASYS_HOME
 from oasys.router import route_completion, route_stream
 from oasys.providers import get_provider, available_providers, REGISTRY
 from oasys.skills import discover_skills, skills_system_prompt
@@ -37,12 +39,15 @@ FENCE = BACKTICK * 3
 
 EDIT_PATTERN = re.compile(r"EDIT:\s*(\S+)\s*\n" + FENCE + r"[a-zA-Z0-9_+-]*\n(.*?)" + FENCE, re.DOTALL)
 READ_PATTERN = re.compile(r"^READ:\s*(\S+)\s*$", re.MULTILINE)
-SHELL_PATTERN = re.compile(r"^SHELL:\s*(.+)$", re.MULTILINE)
+# Multi-line SHELL: capture until the next directive line (SHELL:/READ:/EDIT:)
+# or end of message, so heredocs and loops in one block are preserved.
+SHELL_PATTERN = re.compile(r"^SHELL:\s*(.+?)(?=\n(?:SHELL:|READ:|EDIT:)|$)", re.MULTILINE | re.DOTALL)
+
+OVERNIGHT_LOG_DIR = OASYS_HOME / "overnight"
 
 
 class Composer(TextArea):
-    """Multi-line input box. Enter submits; Shift+Enter (or Ctrl+J as a
-    terminal-safe fallback) inserts a newline instead."""
+    """Multi-line input box. Enter submits; Shift+Enter (or Ctrl+J) inserts a newline."""
 
     def on_key(self, event: events.Key) -> None:
         if event.key == "enter":
@@ -56,8 +61,6 @@ class Composer(TextArea):
 
 
 def parse_duration(text: str) -> float:
-    """Parse a duration like '5h', '30m', '90m', '1h30m', '45s', '2d', or a
-    bare number (interpreted as minutes). Returns seconds (float)."""
     text = text.strip().lower()
     mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}
     matches = re.findall(r"(\d+)\s*([smhd])", text)
@@ -91,9 +94,7 @@ class OasysApp(App):
         padding: 0 1;
     }
     #composer:focus { border: solid #c15f3c; }
-    #composer {
-        color: #e0e0e0;
-    }
+    #composer { color: #e0e0e0; }
     """
     BINDINGS = [
         ("ctrl+c", "quit", "Quit"),
@@ -106,12 +107,16 @@ class OasysApp(App):
         self.skills = discover_skills()
         self.plugins = discover_plugins()
         self.stats = SessionStats()
+        # Single source of truth for run state. `mode` is "idle" ONLY when nothing
+        # is running, so the input gate can never flicker open mid-overnight.
+        self.mode = "idle"            # idle | agent | overnight
+        self.active_task = None       # the asyncio.Task currently executing
+        self._stop = asyncio.Event()  # sticky stop request; set once, never cleared mid-run
         self.overnight_active = False
         self.overnight_end = 0.0
         self.overnight_task = None
-        self.cancelled = asyncio.Event()   # set while a run is in flight
-        self.running = False               # True only while an agent/overnight loop is active
-        self.auto_follow = True            # chat follows new output unless user scrolls up
+        self.auto_follow = True
+        self._project_root = None
         self.system_prompt = base_prompt(skills_system_prompt(self.skills))
         self.history = [{"role": "system", "content": self.system_prompt}]
         self.refresh_system_prompt()
@@ -126,6 +131,7 @@ class OasysApp(App):
 
     # ------------------------------------------------------------- composer
     def on_mount(self) -> None:
+        OVERNIGHT_LOG_DIR.mkdir(parents=True, exist_ok=True)
         log = self.query_one("#log", RichLog)
         log.write(f"[#c15f3c]oasys[/] · {len(self.skills)} skills · {len(self.plugins)} plugins loaded")
         log.write("[#666666]/help for commands · /settings to configure · /goal to set objectives[/]")
@@ -141,19 +147,11 @@ class OasysApp(App):
         self.update_status()
 
     def _resize_composer(self) -> None:
-        """Size the composer to its content (1..max lines) so new lines make
-        it grow; beyond max it gets a scrollbar.
-
-        +2 accounts for the composer's own top+bottom border: `height` sets
-        the border-box, so without this the border rows eat into the
-        content area and, at small sizes, leave zero rows for the text
-        itself (it's still there, just rendered with no visible space)."""
         ta = self.query_one("#composer", TextArea)
         lines = max(1, ta.document.line_count)
         ta.styles.height = min(12, lines + 2)
 
     def on_text_area_changed(self, event) -> None:
-        # Any content change may change the composer's required height.
         if event.text_area.id == "composer":
             self._resize_composer()
 
@@ -168,8 +166,11 @@ class OasysApp(App):
     def handle_user_input(self, user_text: str) -> None:
         log = self.query_one("#log", RichLog)
         user_text = (user_text or "").strip()
-        # Empty submission while a run is active = interrupt.
-        if self.running:
+
+        # While anything is running, only an interrupt is accepted. Because
+        # `mode` stays non-idle across the whole overnight (including sleeps and
+        # compaction), a stray message can never spawn a second concurrent loop.
+        if self.mode != "idle":
             if user_text in ("", "/stop", "stop"):
                 self.request_interrupt()
                 log.write("[#c15f3c]interrupt requested - finishing current step...[/]")
@@ -188,7 +189,6 @@ class OasysApp(App):
             if cmd == "/compact":
                 asyncio.ensure_future(self.do_compact(log))
             elif cmd in ("/overnight",):
-                # overnight manages its own async task/flag
                 result = self.handle_overnight_command(args)
                 if result:
                     log.write(result)
@@ -201,11 +201,19 @@ class OasysApp(App):
             return
 
         self.history.append({"role": "user", "content": user_text})
-        asyncio.ensure_future(self.run_agent_loop(log))
+        self._stop.clear()
+        self.mode = "agent"
+        self.active_task = asyncio.ensure_future(self.run_agent_loop(log, nested=False))
 
     def request_interrupt(self) -> None:
-        self.cancelled.set()
-        self.overnight_active = False
+        # Sticky flag + hard cancel of the underlying task so a stop is immediate.
+        self._stop.set()
+        if self.active_task is not None and not self.active_task.done():
+            self.active_task.cancel()
+
+    def check_interrupt(self) -> bool:
+        """True if a stop was requested. The flag is sticky (never cleared mid-run)."""
+        return self._stop.is_set()
 
     def update_status(self) -> None:
         try:
@@ -215,11 +223,10 @@ class OasysApp(App):
                 hh, rem = divmod(int(remaining), 3600)
                 mm, ss = divmod(rem, 60)
                 base = f"[#c15f3c]OVERNIGHT {hh:02d}:{mm:02d}:{ss:02d}[/] " + base
-            elif self.running:
+            elif self.mode == "agent":
                 base = "[#c15f3c]RUNNING - Enter or /stop to interrupt[/] " + base
             self.query_one("#status", Static).update(base)
         except Exception:
-            # Widget may be torn down (app exiting) - ignore.
             pass
 
     def refresh_system_prompt(self) -> None:
@@ -277,12 +284,10 @@ class OasysApp(App):
         if sub == "get" and len(toks) >= 2:
             val = settings_mod.get_key(toks[1], config)
             return f"[#666666]{toks[1]}:[/] {val if val is not None else '[#cc4444](unset)[/]'}"
-
         if sub == "set" and len(toks) >= 3:
             key, value = toks[1], " ".join(toks[2:])
             new_config = settings_mod.set_key(key, value)
             return f"[#666666]updated:[/] {key} = {value}\n\n" + settings_mod.render(new_config)
-
         if sub == "providers":
             lines = ["[#666666]configured providers (from config.yaml):[/]"]
             cfg = settings_mod.list_providers()
@@ -294,10 +299,8 @@ class OasysApp(App):
             for n in REGISTRY.keys():
                 lines.append(f"  - {n}")
             return "\n".join(lines)
-
         if sub == "add" and len(toks) >= 2 and toks[1] == "provider":
             return self._settings_add_provider(toks[2:])
-
         if sub == "remove" and len(toks) >= 2 and toks[1] == "provider":
             name = toks[2] if len(toks) > 2 else ""
             if not name:
@@ -306,7 +309,6 @@ class OasysApp(App):
             if ok:
                 return f"[#666666]removed provider[/] {name}"
             return f"[#cc4444]no such provider:[/] {name}"
-
         return "[#cc4444]usage: see '/settings' (no args) for subcommands[/]"
 
     def _settings_add_provider(self, rest: list) -> str:
@@ -367,34 +369,41 @@ class OasysApp(App):
         return f"[#666666]goal added (#{n}):[/] {text}"
 
     def handle_overnight_command(self, args: str) -> str:
-        if self.overnight_active:
+        force = False
+        raw = (args or "").strip()
+        if raw.endswith("--force"):
+            force = True
+            raw = raw[: -len("--force")].strip()
+        if self.mode == "overnight":
             return "[#cc4444]overnight already running - type /stop to halt[/]"
-        if not args.strip():
-            return "[#cc4444]usage: /overnight <duration>  e.g. /overnight 5h, /overnight 30m, /overnight 1h30m, /overnight 2d[/]"
+        if not raw:
+            return "[#cc4444]usage: /overnight <duration> [--force]  e.g. /overnight 5h, /overnight 30m, /overnight 1h30m, /overnight 2d[/]"
         try:
-            secs = parse_duration(args.strip())
+            secs = parse_duration(raw)
         except Exception:
             return "[#cc4444]could not parse duration. Use like 5h, 30m, 90m, 1h30m, 2d, or 45 (minutes)[/]"
         if secs <= 0:
             return "[#cc4444]duration must be positive[/]"
         goals = settings_mod.get_goals()
-        if not goals:
+        if not goals and not force:
             return (
                 "[#cc4444]no goals set.[/] /overnight works best with a /goal. "
                 "Set one first (e.g. /goal refactor the router for clarity). "
-                "Re-run /overnight anyway to use generic self-improvement?"
+                "Re-run with: /overnight <duration> --force to use generic self-improvement."
             )
+        self._stop.clear()
         self.overnight_active = True
         self.overnight_end = time.time() + secs
-        self.cancelled.clear()
+        self.mode = "overnight"
         self.overnight_task = asyncio.ensure_future(self.run_overnight(secs))
+        self.active_task = self.overnight_task
         return (
             f"[#c15f3c]overnight started[/] - autonomous for ~{secs/3600:.2f}h ({(secs//60):.0f} min). "
             f"Type /stop to halt. Goals loaded: {len(goals)}"
         )
 
     def handle_stop_command(self) -> str:
-        if not (self.overnight_active or self.cancelled.is_set()):
+        if self.mode == "idle":
             return "[#666666]no run is in progress[/]"
         self.request_interrupt()
         return "[#c15f3c]stopping after the current step...[/]"
@@ -412,7 +421,7 @@ class OasysApp(App):
                 "[#c15f3c]/settings[/] view/change config (set/get/add provider/remove provider/providers)\n"
                 "[#c15f3c]/key <provider> <api_key>[/] save API key (persists to .env)\n"
                 "[#c15f3c]/goal <text>[/] set a standing objective (also: /goal list|remove <n>|clear)\n"
-                "[#c15f3c]/overnight <duration>[/] run autonomously, e.g. /overnight 5h\n"
+                "[#c15f3c]/overnight <duration> [--force][/] run autonomously, e.g. /overnight 5h\n"
                 "[#c15f3c]/stop[/] halt an in-flight run\n"
                 "[#c15f3c]/plugin marketplace add <owner/repo>[/] add a marketplace\n"
                 "[#c15f3c]/plugin install <name>@<alias>[/] install a skill/plugin\n"
@@ -502,40 +511,70 @@ class OasysApp(App):
             "twice; if stuck, move to a different improvement."
         )
 
+    def _history_tokens(self) -> int:
+        return sum(len(str(m.get("content", ""))) // 4 for m in self.history)
+
     async def run_overnight(self, duration_sec: float) -> None:
         log = self.query_one("#log", RichLog)
         end = time.time() + duration_sec
         self.overnight_end = end
         iteration = 0
-        compact_every = max(1, int(settings_mod.load().get("overnight_compact_every", 5) or 5))
+        config = settings_mod.load()
+        compact_every = max(1, int(config.get("overnight_compact_every", 5) or 5))
+        max_hist = int(config.get("max_history_tokens", 12000) or 12000)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        olog_path = OVERNIGHT_LOG_DIR / f"overnight-{stamp}.log"
+
+        self.mode = "overnight"
+        self.overnight_active = True
         log.write(f"[#c15f3c]=== OVERNIGHT MODE STARTED (~{duration_sec/60:.0f}m) ===[/]")
-        self.running = True
+        self.update_status()
         try:
-            while time.time() < end and self.overnight_active:
-                iteration += 1
-                remaining = int(end - time.time())
-                log.write(f"[#c15f3c]--- overnight iteration {iteration} ({(remaining//60)}m left) ---[/]")
-                self.update_status()
-                self.history.append({"role": "user", "content": self.autonomous_prompt(iteration)})
-                try:
-                    await self.run_agent_loop(log)
-                except Exception as e:
-                    log.write(f"[#cc4444]overnight iteration error:[/] {e}")
-                if self.cancelled.is_set():
-                    break
-                if iteration % compact_every == 0:
-                    log.write("[#666666]overnight compaction...[/]")
+            with open(olog_path, "a") as olog:
+                olog.write(f"OVERNIGHT START {time.ctime()} for {duration_sec:.0f}s\n")
+                while time.time() < end and not self._stop.is_set():
+                    iteration += 1
+                    remaining = int(end - time.time())
+                    log.write(f"[#c15f3c]--- overnight iteration {iteration} ({(remaining//60)}m left) ---[/]")
+                    self.update_status()
+                    self.history.append({"role": "user", "content": self.autonomous_prompt(iteration)})
+                    task = asyncio.ensure_future(self.run_agent_loop(log, nested=True))
+                    self.active_task = task
                     try:
-                        await self.do_compact(log)
+                        await task
+                    except asyncio.CancelledError:
+                        break
                     except Exception as e:
-                        log.write(f"[#cc4444]compact failed:[/] {e}")
-                await asyncio.sleep(0.5)
+                        log.write(f"[#cc4444]overnight iteration error:[/] {e}")
+                        olog.write(f"[iter {iteration} error] {e}\n")
+                    if self._stop.is_set():
+                        break
+                    # Keep history bounded between scheduled compactions.
+                    if self._history_tokens() > max_hist:
+                        try:
+                            await self.do_compact(log)
+                        except Exception as e:
+                            log.write(f"[#cc4444]compact failed:[/] {e}")
+                    elif iteration % compact_every == 0:
+                        log.write("[#666666]overnight compaction...[/]")
+                        try:
+                            await self.do_compact(log)
+                        except Exception as e:
+                            log.write(f"[#cc4444]compact failed:[/] {e}")
+                    await asyncio.sleep(0.5)
         finally:
             self.overnight_active = False
-            self.cancelled.clear()
-            self.running = False
+            self.mode = "idle"
+            self.active_task = None
             self.overnight_end = 0.0
-            log.write("[#c15f3c]=== OVERNIGHT MODE ENDED ===[/]")
+            summary = f"=== OVERNIGHT MODE ENDED after {iteration} iteration(s) ==="
+            log.write("[#c15f3c]" + summary + "[/]")
+            try:
+                with open(olog_path, "a") as olog:
+                    olog.write(f"OVERNIGHT END {time.ctime()} iterations={iteration} "
+                               f"stopped={self._stop.is_set()}\n")
+            except Exception:
+                pass
             self.update_status()
 
     def extract_actions(self, reply: str):
@@ -551,18 +590,14 @@ class OasysApp(App):
         remaining = SHELL_PATTERN.sub("", remaining)
         return remaining.strip(), actions
 
-    def check_interrupt(self) -> bool:
-        """Return True if the user requested an interrupt; clears the flag."""
-        if self.cancelled.is_set():
-            self.cancelled.clear()
-            return True
-        return False
-
-    async def run_agent_loop(self, log: RichLog) -> None:
+    async def run_agent_loop(self, log: RichLog, nested: bool = False) -> None:
         config = settings_mod.load()
-        max_steps = config.get("max_agent_steps", 25)
-        self.cancelled.clear()
-        self.running = True
+        max_steps = int(config.get("max_agent_steps", 150) or 150)
+        self._project_root = config.get("project_root") or None
+        show_live = bool(config.get("show_live_stream", False))
+        if not nested:
+            self._stop.clear()
+            self.mode = "agent"
         self.update_status()
 
         try:
@@ -577,34 +612,37 @@ class OasysApp(App):
                 usage = {}
 
                 try:
-                    async for chunk, done, u, model in route_stream(self.history):
-                        model_used = model
-                        if chunk:
-                            full_text += chunk
-                        if u:
-                            usage = u
-                        if done:
-                            break
-                        if self.cancelled.is_set():
-                            break
+                    gen = route_stream(self.history)
+                    try:
+                        async for chunk, done, u, model in gen:
+                            model_used = model
+                            if chunk:
+                                full_text += chunk
+                                if show_live:
+                                    log.write(chunk)
+                            if u:
+                                usage = u
+                            if done:
+                                break
+                            if self.check_interrupt():
+                                break
+                    finally:
+                        await gen.aclose()
                 except asyncio.CancelledError:
-                    # Task was cancelled (app closing or interrupted) - stop cleanly.
-                    return
+                    raise
                 except Exception as e:
                     log.write(f"[#cc4444]error:[/] {e}")
                     log.write("")
                     return
 
-                # If interrupted mid-stream, show what we have and stop.
-                if self.cancelled.is_set():
+                if self.check_interrupt():
                     full_text += " [interrupted]"
                     self.history.append({"role": "assistant", "content": full_text})
                     display, actions = self.extract_actions(full_text)
-                    if display:
+                    if display and not show_live:
                         log.write(f"[#c15f3c]oasys[/] [#666666]({model_used})[/]")
                         log.write(Markdown(display))
                     log.write("[#c15f3c]interrupted.[/]")
-                    self.cancelled.clear()
                     return
 
                 elapsed = time.perf_counter() - start
@@ -614,7 +652,7 @@ class OasysApp(App):
                 self.history.append({"role": "assistant", "content": full_text})
                 display_text, actions = self.extract_actions(full_text)
 
-                if display_text:
+                if display_text and not show_live:
                     log.write(f"[#c15f3c]oasys[/] [#666666]({model_used})[/]")
                     log.write(Markdown(display_text))
 
@@ -628,7 +666,7 @@ class OasysApp(App):
                 for kind, target, content in actions:
                     if kind == "shell":
                         log.write(f"[#c15f3c]$[/] {target}")
-                        out = await run_shell(target)
+                        out = await run_shell(target, cwd=self._project_root)
                         log.write(f"[#666666]{out}[/]")
                         outputs.append(f"$ {target}\n{out}")
                     elif kind == "read":
@@ -644,8 +682,6 @@ class OasysApp(App):
                         log.write(f"[#666666]{msg}[/]")
                         outputs.append(f"[edit {target}]\n{msg}")
 
-                    # Check for interrupt between tool calls so we don't hang
-                    # through a long sequence of actions.
                     if self.check_interrupt():
                         log.write("[#c15f3c]interrupted.[/]")
                         self.history.append({"role": "user", "content": "[action results]\n" + "\n\n".join(outputs)})
@@ -658,9 +694,10 @@ class OasysApp(App):
             log.write(f"[#cc4444]stopped: hit {max_steps}-step limit for this turn (change with /settings set max_agent_steps N)[/]")
             log.write("")
         finally:
-            self.cancelled.clear()
-            self.running = False
-            self.update_status()
+            if not nested:
+                self.mode = "idle"
+                self.active_task = None
+                self.update_status()
 
 
 def main() -> None:

@@ -2,11 +2,19 @@
 import time
 import json
 import httpx
-from .base import Provider
+from .base import Provider, RateLimitError
 from ..keystore import get_key
+from oasys import settings as settings_mod
 
 _CACHE = {"models": [], "ts": 0}
 CACHE_TTL = 3600
+
+
+def _fallback_model() -> str:
+    try:
+        return settings_mod.load().get("fallback_free_model") or "meta-llama/llama-3.3-70b-instruct:free"
+    except Exception:
+        return "meta-llama/llama-3.3-70b-instruct:free"
 
 
 class OpenRouterProvider(Provider):
@@ -40,20 +48,25 @@ class OpenRouterProvider(Provider):
                 return free
         except Exception:
             pass
-        return _CACHE["models"] or ["meta-llama/llama-3.3-70b-instruct:free"]
+        return _CACHE["models"] or [_fallback_model()]
+
+    def _post(self, client, messages, model):
+        resp = client.post(
+            f"{self.base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"model": model, "messages": messages},
+        )
+        if resp.status_code == 429:
+            raise RateLimitError(f"rate limited (429) for {model}")
+        resp.raise_for_status()
+        return resp.json()
 
     async def complete(self, messages: list[dict], model: str) -> dict:
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{self.base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={"model": model, "messages": messages},
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            data = self._post(client, messages, model)
             return {
                 "content": data["choices"][0]["message"]["content"],
                 "model_used": model,
@@ -71,6 +84,8 @@ class OpenRouterProvider(Provider):
                 },
                 json={"model": model, "messages": messages, "stream": True},
             ) as resp:
+                if resp.status_code == 429:
+                    raise RateLimitError(f"rate limited (429) for {model}")
                 resp.raise_for_status()
                 usage = {}
                 async for line in resp.aiter_lines():

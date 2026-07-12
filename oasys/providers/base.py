@@ -1,4 +1,3 @@
-"""Common interface every provider must implement."""
 from abc import ABC, abstractmethod
 
 
@@ -16,8 +15,10 @@ class Provider(ABC):
         ...
 
     async def stream_complete(self, messages: list[dict], model: str):
-        """Optional. Yield (chunk_text, done, usage) tuples as they arrive.
-        Providers that don't support streaming should not override this;
-        the router falls back to complete() automatically."""
+        """Optional. Yield (chunk_text, done, usage) tuples as they arrive."""
         raise NotImplementedError
         yield  # pragma: no cover
+
+
+class RateLimitError(Exception):
+    """Raised when the provider returns HTTP 429 (rate limited / throttled)."""

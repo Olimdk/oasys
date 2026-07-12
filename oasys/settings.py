@@ -1,23 +1,4 @@
-"""Read/write config.yaml (in the user OASYS_HOME dir) plus skill/plugin dirs.
-
-Config shape (YAML):
-    provider: openrouter
-    models: []
-    max_agent_steps: 150
-    show_live_stream: false
-    voice:
-      input_enabled: false
-      output_enabled: false
-      tts_provider: none
-    overnight_compact_every: 5
-    providers:
-      - name: openai
-        base_url: https://api.openai.com/v1
-        api_key_env: OPENAI_API_KEY
-        models: [gpt-4o-mini]
-    goals:
-      - "make the CLI faster"
-"""
+"""Read/write config.yaml (in the user OASYS_HOME dir) plus skill/plugin dirs."""
 import yaml
 from pathlib import Path
 from oasys import OASYS_HOME
@@ -36,6 +17,11 @@ DEFAULTS = {
     "overnight_compact_every": 5,
     "providers": [],
     "goals": [],
+    # --- additions ---
+    "project_root": "",            # cwd for autonomous/overnight shell commands
+    "shell_timeout": 120,          # seconds; agent shell commands are killed past this
+    "fallback_free_model": "meta-llama/llama-3.3-70b-instruct:free",
+    "max_history_tokens": 12000,   # compact overnight history once it exceeds this
 }
 
 
@@ -64,7 +50,6 @@ def save(config: dict) -> None:
 
 
 def set_key(dotted_key: str, value: str):
-    """Supports 'provider' or nested 'voice.output_enabled'."""
     config = load()
     parts = dotted_key.split(".")
     target = config
@@ -164,9 +149,13 @@ def render(config: dict | None = None) -> str:
         f"max_agent_steps: {config.get('max_agent_steps')}",
         f"show_live_stream: {config.get('show_live_stream')}",
         f"voice.input_enabled: {voice.get('input_enabled')}",
-        f"voice.output_enabled: {voice.get('output_enabled')}",
+        f"voice.output_enabled: {voice.get('voice.output_enabled', voice.get('output_enabled'))}",
         f"voice.tts_provider: {voice.get('tts_provider')}",
         f"overnight_compact_every: {config.get('overnight_compact_every')}",
+        f"project_root: {config.get('project_root') or '(current dir)'}",
+        f"shell_timeout: {config.get('shell_timeout')}s",
+        f"fallback_free_model: {config.get('fallback_free_model')}",
+        f"max_history_tokens: {config.get('max_history_tokens')}",
     ]
     goals = config.get("goals", [])
     lines.append(f"goals ({len(goals)}):")
