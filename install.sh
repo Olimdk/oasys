@@ -30,7 +30,7 @@ REPO="https://github.com/Olimdk/oasys.git"
 BRANCH="${OASYS_BRANCH:-main}"
 
 # Baked per release. On 'main' this is empty (rolling latest).
-OASYS_VERSION="v0.2.0"
+OASYS_VERSION=""
 
 # Resolve the ref to install: explicit override wins, else the baked version.
 REF="${OASYS_REF:-${OASYS_VERSION}}"
