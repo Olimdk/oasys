@@ -1,19 +1,39 @@
 #!/usr/bin/env bash
 #
 # OASYS one-command installer (installs the package into a venv).
-#   curl -fsSL https://raw.githubusercontent.com/Olimdk/oasys/main/install.sh | bash
 #
-# Environment overrides:
-#   OASYS_HOME     install directory   (default: ~/.local/share/oasys)
-#   OASYS_BRANCH   git branch to clone (default: main)
-#   OASYS_PROVIDER provider name       (default: openrouter)  - used with OASYS_API_KEY
-#   OASYS_API_KEY  API key             (optional; prompted if omitted)
+#   Install the LATEST (rolling main):
+#     curl -fsSL https://raw.githubusercontent.com/Olimdk/oasys/main/install.sh | bash
+#
+#   Install a SPECIFIC RELEASE (one curl command per version):
+#     curl -fsSL https://raw.githubusercontent.com/Olimdk/oasys/v0.2.0/install.sh | bash
+#
+#   You can still override the version explicitly if you like:
+#     curl -fsSL https://raw.githubusercontent.com/Olimdk/oasys/main/install.sh | OASYS_REF=v0.2.0 bash
+#
+#   Environment overrides:
+#     OASYS_HOME     install directory   (default: ~/.local/share/oasys)
+#     OASYS_BRANCH   git branch to clone (default: main)   - used only on first clone
+#     OASYS_REF      git ref to pin/roll back to: tag | branch | commit
+#                     (default: empty -> the OASYS_VERSION baked into this file)
+#     OASYS_PROVIDER provider name       (default: openrouter)  - used with OASYS_API_KEY
+#     OASYS_API_KEY  API key             (optional; prompted if omitted)
+#
+#   How per-version curl works: each release's install.sh has OASYS_VERSION
+#   baked in (e.g. "v0.2.0"). When you fetch that release's install.sh from
+#   GitHub, it checks out the matching tag automatically -- no guessing.
 #
 set -euo pipefail
 
 OASYS_HOME="${OASYS_HOME:-$HOME/.local/share/oasys}"
 REPO="https://github.com/Olimdk/oasys.git"
 BRANCH="${OASYS_BRANCH:-main}"
+
+# Baked per release. On 'main' this is empty (rolling latest).
+OASYS_VERSION="v0.2.0"
+
+# Resolve the ref to install: explicit override wins, else the baked version.
+REF="${OASYS_REF:-${OASYS_VERSION}}"
 
 echo "==> OASYS installer"
 
@@ -31,10 +51,26 @@ fi
 # --- clone / update ---
 if [ -d "$OASYS_HOME/.git" ]; then
   echo "==> updating existing install at $OASYS_HOME"
-  git -C "$OASYS_HOME" pull --ff-only
+  git -C "$OASYS_HOME" fetch --tags --force "$REPO"
+  if [ -n "$REF" ]; then
+    # Pin/roll back to an explicit release. This is what lets you go BACK
+    # to a previous version if a newer release breaks things.
+    echo "==> pinning to $REF"
+    git -C "$OASYS_HOME" checkout --force "$REF"
+  else
+    # No ref requested: move forward on the configured branch (rolling latest).
+    git -C "$OASYS_HOME" checkout --force "$BRANCH"
+    git -C "$OASYS_HOME" pull --ff-only
+  fi
 else
   echo "==> cloning OASYS into $OASYS_HOME"
-  git clone --depth 1 -b "$BRANCH" "$REPO" "$OASYS_HOME"
+  if [ -n "$REF" ]; then
+    # Clone full history (not shallow) so the tag/commit ref is reachable.
+    git clone "$REPO" "$OASYS_HOME"
+    git -C "$OASYS_HOME" checkout --force "$REF"
+  else
+    git clone --depth 1 -b "$BRANCH" "$REPO" "$OASYS_HOME"
+  fi
 fi
 
 cd "$OASYS_HOME"
@@ -46,7 +82,9 @@ fi
 # shellcheck disable=SC1091
 source venv/bin/activate
 pip install --quiet --upgrade pip
-pip install --quiet .
+# Force reinstall so a rollback to an older tree actually takes effect
+# in the venv (otherwise the previously installed version can linger).
+pip install --quiet --force-reinstall --no-deps .
 
 # --- API key / config (only if missing) ---
 if [ ! -f "$HOME/.oasys/.env" ] || [ ! -f "$HOME/.oasys/config.yaml" ]; then
@@ -84,7 +122,14 @@ else
   fi
 fi
 
+# Report the active release so it is obvious what you are running.
+ACTIVE="$(git -C "$OASYS_HOME" describe --tags --always 2>/dev/null || echo unknown)"
 echo
-echo "==> OASYS installed."
+echo "==> OASYS installed. Active release: $ACTIVE"
 echo "    Run it with:  oasys"
+if [ -n "$REF" ]; then
+  echo "    Re-run this exact version:  curl -fsSL https://raw.githubusercontent.com/Olimdk/oasys/$REF/install.sh | bash"
+else
+  echo "    Re-run latest:  curl -fsSL https://raw.githubusercontent.com/Olimdk/oasys/main/install.sh | bash"
+fi
 echo "    First run opens the TUI. Set a key anytime with:  /key openrouter <key>"
