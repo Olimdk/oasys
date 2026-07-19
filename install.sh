@@ -6,10 +6,10 @@
 #     curl -fsSL https://raw.githubusercontent.com/Olimdk/oasys/main/install.sh | bash
 #
 #   Install a SPECIFIC RELEASE (one curl command per version):
-#     curl -fsSL https://raw.githubusercontent.com/Olimdk/oasys/v0.2.0/install.sh | bash
+#     curl -fsSL https://raw.githubusercontent.com/Olimdk/oasys/v0.2.1/install.sh | bash
 #
 #   You can still override the version explicitly if you like:
-#     curl -fsSL https://raw.githubusercontent.com/Olimdk/oasys/main/install.sh | OASYS_REF=v0.2.0 bash
+#     curl -fsSL https://raw.githubusercontent.com/Olimdk/oasys/main/install.sh | OASYS_REF=v0.2.1 bash
 #
 #   Environment overrides:
 #     OASYS_HOME     install directory   (default: ~/.local/share/oasys)
@@ -19,8 +19,12 @@
 #     OASYS_PROVIDER provider name       (default: openrouter)  - used with OASYS_API_KEY
 #     OASYS_API_KEY  API key             (optional; prompted if omitted)
 #
+#   NOTE: OASYS_HOME controls where the code is installed. Your personal data
+#   (config + API keys) always lives in ~/.oasys and is never touched by
+#   upgrades or rollbacks. To relocate the data dir too, set OASYS_DATA_HOME.
+#
 #   How per-version curl works: each release's install.sh has OASYS_VERSION
-#   baked in (e.g. "v0.2.0"). When you fetch that release's install.sh from
+#   baked in (e.g. "v0.2.1"). When you fetch that release's install.sh from
 #   GitHub, it checks out the matching tag automatically -- no guessing.
 #
 set -euo pipefail
@@ -29,8 +33,12 @@ OASYS_HOME="${OASYS_HOME:-$HOME/.local/share/oasys}"
 REPO="https://github.com/Olimdk/oasys.git"
 BRANCH="${OASYS_BRANCH:-main}"
 
+# Personal data dir (config + keys). Independent of the install location so
+# that reinstalls / rollbacks never disturb user data.
+DATA_HOME="${OASYS_DATA_HOME:-$HOME/.oasys}"
+
 # Baked per release. On 'main' this is empty (rolling latest).
-OASYS_VERSION=""
+OASYS_VERSION="v0.2.1"
 
 # Resolve the ref to install: explicit override wins, else the baked version.
 REF="${OASYS_REF:-${OASYS_VERSION}}"
@@ -81,26 +89,32 @@ if [ ! -d venv ]; then
 fi
 # shellcheck disable=SC1091
 source venv/bin/activate
+
+# Upgrade pip, then install OASYS WITH its runtime dependencies.
+# We intentionally do NOT use --no-deps: the package declares its runtime
+# dependencies (textual, pyyaml, httpx, ...) in pyproject.toml and they must
+# be installed or the app will crash on first import.
 pip install --quiet --upgrade pip
-# Force reinstall so a rollback to an older tree actually takes effect
-# in the venv (otherwise the previously installed version can linger).
-pip install --quiet --force-reinstall --no-deps .
+pip install --quiet --upgrade .
 
 # --- API key / config (only if missing) ---
-if [ ! -f "$HOME/.oasys/.env" ] || [ ! -f "$HOME/.oasys/config.yaml" ]; then
-  if [ ! -f "$HOME/.oasys/.env" ]; then
-    if [ -z "${OASYS_API_KEY:-}" ]; then
+if [ ! -f "$DATA_HOME/.env" ] || [ ! -f "$DATA_HOME/config.yaml" ]; then
+  if [ ! -f "$DATA_HOME/.env" ]; then
+    if [ -z "${OASYS_API_KEY:-}" ] && [ -t 0 ]; then
+      # Interactive: prompt for provider + key.
       read -r -p "Provider [openrouter]: " PROV
       PROV="${PROV:-openrouter}"
       read -r -s -p "API key for $PROV: " KEY
       echo
     else
+      # Non-interactive: use env vars (OASYS_API_KEY / OASYS_PROVIDER) or skip.
       PROV="${OASYS_PROVIDER:-openrouter}"
-      KEY="$OASYS_API_KEY"
+      KEY="${OASYS_API_KEY:-}"
     fi
-    OASYS_PROVIDER="$PROV" OASYS_API_KEY="$KEY" python3 -m oasys.setup_wizard
+    OASYS_HOME="$DATA_HOME" OASYS_PROVIDER="$PROV" OASYS_API_KEY="$KEY" python3 -m oasys.setup_wizard
   else
-    python3 -m oasys.setup_wizard
+    # .env present but config missing: (re)write config non-interactively.
+    OASYS_HOME="$DATA_HOME" python3 -m oasys.setup_wizard
   fi
 fi
 
@@ -126,6 +140,7 @@ fi
 ACTIVE="$(git -C "$OASYS_HOME" describe --tags --always 2>/dev/null || echo unknown)"
 echo
 echo "==> OASYS installed. Active release: $ACTIVE"
+echo "    Data directory: $DATA_HOME"
 echo "    Run it with:  oasys"
 if [ -n "$REF" ]; then
   echo "    Re-run this exact version:  curl -fsSL https://raw.githubusercontent.com/Olimdk/oasys/$REF/install.sh | bash"

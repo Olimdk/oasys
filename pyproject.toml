@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oasys"
-version = "0.2.0"
+version = "0.2.1"
 description = "OASYS - a local autonomous coding assistant with a Claude Code-style TUI, free-model fallback, and autonomous /overnight mode."
 readme = "README.md"
 requires-python = ">=3.10"

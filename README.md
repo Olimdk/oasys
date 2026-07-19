@@ -17,13 +17,13 @@ TUI, skills, plugins, provider system, and an autonomous /overnight mode.
 
     curl -fsSL https://raw.githubusercontent.com/Olimdk/oasys/main/install.sh | bash
 
-The installer clones OASYS, creates a Python virtualenv, installs the package, prompts for
-your provider + API key, and drops an `oasys` launcher on your PATH. Pre-fill the key for an
-unattended install:
+The installer clones OASYS, creates a Python virtualenv, installs the package (with all its
+runtime dependencies), prompts for your provider + API key, and drops an `oasys` launcher on
+your PATH. Pre-fill the key for an unattended install:
 
     OASYS_API_KEY=sk-or-... curl -fsSL https://raw.githubusercontent.com/Olimdk/oasys/main/install.sh | bash
 
-Install somewhere else:
+Relocate the install directory (code only):
 
     OASYS_HOME=~/my-oasys curl -fsSL https://raw.githubusercontent.com/Olimdk/oasys/main/install.sh | bash
 
@@ -45,8 +45,11 @@ Or with pipx (recommended for a clean global install):
     cd oasys
     pipx install .
 
-User data (config, API keys, installed skills/plugins) lives in `~/.oasys` (override with the
-`OASYS_HOME` environment variable), so the installed package directory stays read-only.
+User data (config, API keys, installed skills/plugins) lives in `~/.oasys` by default. It is
+never touched by upgrades or rollbacks. Override its location with the `OASYS_DATA_HOME`
+environment variable (the install directory, `OASYS_HOME`, is separate and holds only code):
+
+    OASYS_DATA_HOME=~/my-oasys-data oasys
 
 ## Managing your API key
 
@@ -103,7 +106,7 @@ This writes the provider into `~/.oasys/config.yaml` and it is available immedia
 Set one or more goals, then let OASYS work unattended for a duration:
 
     /goal refactor the router for clarity
-    /goal add tests for the plugins module
+    /goal add tests for the overnight loop
     /overnight 5h
 
 It iterates: inspect repo state -> pick one small safe change -> implement it -> run tests ->
